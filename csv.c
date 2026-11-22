@@ -1,4 +1,4 @@
-// csv.c, built to csv.wasm by build.sh: reads /input/cases.json's bytes and writes the whole answers.json, csv-reader
+// csv.c, built to csv.wasm by build.sh: reads /input/cases.json's bytes and writes answers.json, csv-reader
 // 1.0.0's answer for every case, without ever decoding a string.
 //
 // A case's text is read straight from its JSON spelling. The only characters csv-reader cares about are the comma, the
@@ -28,9 +28,13 @@ static u8 *bump(u32 size) {
   heap_top = (p + size + 15) & ~15u;
   return (u8 *)p;
 }
+
+// Hands n bytes of the answers file, the next ones, to main.ts, which writes them out.
+__attribute__((import_module("env"), import_name("flush"))) void flush(const u8 *p, u32 n);
 #else
 // A native build, for testing on a machine without a wasm linker: SSE2 in place of wasm's SIMD, malloc for memory.
 #include <emmintrin.h>
+#include <stdio.h>
 #include <stdlib.h>
 typedef __m128i v128_t;
 #define wasm_v128_load(p) _mm_loadu_si128((const __m128i *)(p))
@@ -46,6 +50,8 @@ static u8 *bump(u32 size) {
   if (!p) __builtin_trap();
   return p;
 }
+
+static void flush(const u8 *p, u32 n) { fwrite(p, 1, n, stdout); }
 #endif
 
 typedef struct {
@@ -91,11 +97,10 @@ static void append(Buf *b, const Buf *from) {
 
 static const u8 *s;  // the input, a raw '"' at its end and zeros after
 static u32 n;
-static Buf O, E, X;  // the answers, this case's errors, this record's cut fields
-static Buf *F;       // where the field being read goes
+static Buf O, X, XS;  // the answers, this record's cut fields, this case's long rows' cut fields
+static Buf *F;        // where the field being read goes
 
-static u32 pos, line, record_line, record_row;
-static int record_row_null;
+static u32 pos, line, record_line, record_rec;
 
 enum { COMMA, LINE_BREAK, END };
 static int ended;
@@ -116,21 +121,33 @@ static void check_u(u32 i) {
   if (v == 0x0a || v == 0x0d || v == 0x22 || v == 0x2c) __builtin_trap();
 }
 
-static void error_head(const char *code, u32 len) {
-  if (E.len) lit(&E, ",", 1);
-  lit(&E, "{\"code\":\"", 9);
-  lit(&E, code, len);
-  lit(&E, "\",\"line\":", 9);
-  num(&E, record_line);
-  lit(&E, ",\"row\":", 7);
-  if (record_row_null) lit(&E, "null", 4);
-  else num(&E, record_row);
+// A case's errors are kept as records until its header flag is known, since the flag decides each one's row and the
+// case's text is read before the flag (which may come after it).
+typedef struct {
+  const char *code;
+  u32 code_len, line, rec;  // rec: the record's index among the case's records, empty ones not counted
+  u32 kind, a, b;           // kind 1: short_row with a fields; 2: long_row, its extras XS[a, a + b)
+} Err;
+static Err *errs;
+static u32 nerr, errcap;
+
+static Err *push_error(const char *code, u32 len) {
+  if (nerr == errcap) {
+    Err *e = (Err *)bump(errcap * 2 * (u32)sizeof(Err));
+    __builtin_memcpy(e, errs, nerr * sizeof(Err));
+    errs = e;
+    errcap *= 2;
+  }
+  Err *e = &errs[nerr++];
+  e->code = code;
+  e->code_len = len;
+  e->line = record_line;
+  e->rec = record_rec;
+  e->kind = 0;
+  return e;
 }
 
-static void error(const char *code, u32 len) {
-  error_head(code, len);
-  lit(&E, "}", 1);
-}
+static void error(const char *code, u32 len) { push_error(code, len); }
 
 static inline u32 mask3(v128_t v) {
   return wasm_i8x16_bitmask(wasm_v128_or(wasm_v128_or(wasm_i8x16_eq(v, wasm_i8x16_splat(',')), wasm_i8x16_eq(v, wasm_i8x16_splat('\\'))),
@@ -295,91 +312,323 @@ __attribute__((noinline)) static void read_quoted(void) {
   if (added > 0) error("quote_junk", 10);
 }
 
-// One case: its text's JSON spelling starts at p (just past the opening quote).
-__attribute__((noinline)) static void answer(u32 p, int header) {
-  pos = p;
-  line = 1;
-  E.len = 0;
-  if (s[pos] == 0xEF && s[pos + 1] == 0xBB && s[pos + 2] == 0xBF) pos += 3;
-  else if (s[pos] == '\\' && s[pos + 1] == 'u' && hex4(pos + 2) == 0xfeff) pos += 6;
+// Room for k more bytes at o, o and olim being answer()'s cursor into O and O's end.
+#define OROOM(k)              \
+  if (o + (k) > olim) {       \
+    O.len = (u32)(o - O.p);   \
+    grow(&O, (k));            \
+    o = O.p + O.len;          \
+    olim = O.p + O.cap;       \
+  }
 
-  int columns_set = 0;
-  int width = -1;
-  u32 rows = 0;
-  if (header) lit(&O, "{\"columns\":", 11);
-  else lit(&O, "{\"columns\":null,\"rows\":[", 24);
+static u32 case_start, first_end, case_recs;
 
+// One case: its text's JSON spelling starts at p0 (just past the opening quote). Written as if its header flag were
+// false; finish() then fixes the few bytes that differ when it is true (see there). Leaves pos at the text's closing
+// quote.
+//
+// Fields are read here with the cursors in locals; read_quoted() and read_unquoted() are the slow path: a quoted field
+// left unterminated is read again with read_quoted() from its start, and a long row's fields past the width go to X
+// through them.
+__attribute__((noinline)) static void answer(u32 p0) {
+  const u8 *p = s + p0;
+  if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
+  else if (p[0] == '\\' && p[1] == 'u' && hex4((u32)(p - s) + 2) == 0xfeff) p += 6;
+  nerr = 0;
+  XS.len = 0;
+
+  u8 *o = O.p + O.len, *olim = O.p + O.cap;
+  OROOM(64);
+  case_start = (u32)(o - O.p);
+  __builtin_memcpy(o, "{\"columns\":null,\"rows\":[", 24);
+  o += 24;
+
+  u32 ln = 1, recs = 0, width = 0;  // width 0: not set yet
   for (;;) {
     for (;;) {
-      if (s[pos] == '\\' && s[pos + 1] == 'n') {
-        pos += 2;
-        line++;
-      } else if (s[pos] == '\\' && s[pos + 1] == 'r' && s[pos + 2] == '\\' && s[pos + 3] == 'n') {
-        pos += 4;
-        line++;
+      if (p[0] == '\\' && p[1] == 'n') {
+        p += 2;
+        ln++;
+      } else if (p[0] == '\\' && p[1] == 'r' && p[2] == '\\' && p[3] == 'n') {
+        p += 4;
+        ln++;
       } else {
         break;
       }
     }
-    if (s[pos] == '"') break;
+    if (*p == '"') break;
 
-    int is_header = header && !columns_set;
-    record_line = line;
-    record_row_null = is_header;
-    record_row = rows;
-    u32 mark = O.len;
-    if (!is_header && rows > 0) lit(&O, ",", 1);
-    lit(&O, "[", 1);
-    X.len = 0;
+    record_line = ln;
+    record_rec = recs;
+    OROOM(64);
+    u32 mark = (u32)(o - O.p);
+    if (recs) *o++ = ',';
+    *o++ = '[';
 
     u32 k = 0;
-    int quoted, empty;
-    do {
-      if (width >= 0 && k >= (u32)width) {
-        F = &X;
-        if (k > (u32)width) lit(F, ",", 1);
-      } else {
-        F = &O;
-        if (k > 0) lit(F, ",", 1);
+    int quoted, empty = 0, en;
+    for (;;) {
+      OROOM(64);
+      *o++ = '"';
+      quoted = p[0] == '\\' && p[1] == '"';
+      int junk = 0;
+      if (quoted) {
+        u32 fo = (u32)(o - O.p), fl = ln;
+        const u8 *fp = p;
+        int ok = 0;
+        p += 2;
+        for (;;) {
+          OROOM(64);
+          v128_t v = wasm_v128_load(p);
+          wasm_v128_store(o, v);
+          u32 m = mask2(v);
+          if (!m) {
+            p += 16;
+            o += 16;
+            continue;
+          }
+          u32 t = (u32)__builtin_ctz(m);
+          p += t;
+          o += t;
+          if (*p == '"') break;
+          u8 d = p[1];
+          if (d == '"') {
+            if (p[2] == '\\' && p[3] == '"') {
+              o[0] = '\\';
+              o[1] = '"';
+              o += 2;
+              p += 4;
+              continue;
+            }
+            p += 2;
+            ok = 1;
+            break;
+          }
+          if (d == 'r') {
+            o[0] = '\\';
+            o[1] = 'n';
+            o += 2;
+            ln++;
+            p += 2;
+            if (p[0] == '\\' && p[1] == 'n') p += 2;
+            continue;
+          }
+          if (d == 'n') {
+            ln++;
+          } else if (d == 'u') {
+            check_u((u32)(p - s));
+            for (u32 j = 0; j < 6; j++) o[j] = p[j];
+            o += 6;
+            p += 6;
+            continue;
+          }
+          o[0] = p[0];
+          o[1] = p[1];
+          o += 2;
+          p += 2;
+        }
+        if (ok) {
+          if (*p == ',') {
+            p++;
+            en = COMMA;
+            goto field_end;
+          }
+          if (*p == '"') {
+            en = END;
+            goto field_end;
+          }
+          if (p[0] == '\\' && p[1] == 'n') {
+            p += 2;
+            ln++;
+            en = LINE_BREAK;
+            goto field_end;
+          }
+          if (p[0] == '\\' && p[1] == 'r' && p[2] == '\\' && p[3] == 'n') {
+            p += 4;
+            ln++;
+            en = LINE_BREAK;
+            goto field_end;
+          }
+          junk = 1;  // what follows the closing quote is read as unquoted, onto the field
+        } else {
+          // A quote that never closes: read_quoted() reads the field again from its start.
+          O.len = fo;
+          pos = (u32)(fp - s);
+          line = fl;
+          F = &O;
+          read_quoted();
+          o = O.p + O.len;
+          olim = O.p + O.cap;
+          p = s + pos;
+          ln = line;
+          en = ended;
+          goto field_end;
+        }
       }
-      lit(F, "\"", 1);
-      u32 start = F->len;
-      quoted = s[pos] == '\\' && s[pos + 1] == '"';
-      if (quoted) read_quoted();
-      else read_unquoted();
-      empty = F->len == start;
-      lit(F, "\"", 1);
+      u32 start = (u32)(o - O.p);
+      for (;;) {
+        OROOM(64);
+        v128_t v = wasm_v128_load(p);
+        wasm_v128_store(o, v);
+        u32 m = mask3(v);
+        if (!m) {
+          p += 16;
+          o += 16;
+          continue;
+        }
+        u32 t = (u32)__builtin_ctz(m);
+        p += t;
+        o += t;
+        u8 c = *p;
+        if (c == ',') {
+          p++;
+          en = COMMA;
+          break;
+        }
+        if (c == '"') {
+          en = END;
+          break;
+        }
+        u8 d = p[1];
+        if (d == 'n') {
+          p += 2;
+          ln++;
+          en = LINE_BREAK;
+          break;
+        }
+        if (d == 'r') {
+          if (p[2] == '\\' && p[3] == 'n') {
+            p += 4;
+            ln++;
+            en = LINE_BREAK;
+            break;
+          }
+          error("stray_cr", 8);
+          p += 2;
+          continue;
+        }
+        if (d == 'u') {
+          check_u((u32)(p - s));
+          for (u32 j = 0; j < 6; j++) o[j] = p[j];
+          o += 6;
+          p += 6;
+          continue;
+        }
+        o[0] = p[0];
+        o[1] = p[1];
+        o += 2;
+        p += 2;
+      }
+      if (junk) {
+        if ((u32)(o - O.p) != start) error("quote_junk", 10);
+      } else {
+        empty = (u32)(o - O.p) == start;
+      }
+    field_end:
+      *o++ = '"';
       k++;
-    } while (ended == COMMA);
+      if (en != COMMA) break;
+      if (width && k >= width) {
+        // A long row: the rest of its fields are cut to X, and from there to the error's extras.
+        O.len = (u32)(o - O.p);
+        pos = (u32)(p - s);
+        line = ln;
+        X.len = 0;
+        do {
+          F = &X;
+          if (k > width) lit(F, ",", 1);
+          lit(F, "\"", 1);
+          if (s[pos] == '\\' && s[pos + 1] == '"') read_quoted();
+          else read_unquoted();
+          lit(F, "\"", 1);
+          k++;
+        } while (ended == COMMA);
+        Err *e = push_error("long_row", 8);
+        e->kind = 2;
+        e->a = XS.len;
+        e->b = X.len;
+        append(&XS, &X);
+        o = O.p + O.len;
+        olim = O.p + O.cap;
+        p = s + pos;
+        ln = line;
+        break;
+      }
+      *o++ = ',';
+    }
 
     if (k == 1 && empty && !quoted) {
-      O.len = mark;
+      o = O.p + mark;
       continue;
     }
-    if (width < 0) width = (int)k;
-    if (is_header) {
-      columns_set = 1;
-      lit(&O, "],\"rows\":[", 10);
-      continue;
+    if (!width) {
+      width = k;
+    } else if (k < width) {
+      Err *e = push_error("short_row", 9);
+      e->kind = 1;
+      e->a = k;
+      OROOM(3 * (width - k) + 64);
+      for (; k < width; k++) {
+        o[0] = ',';
+        o[1] = '"';
+        o[2] = '"';
+        o += 3;
+      }
     }
-    if (k < (u32)width) {
-      error_head("short_row", 9);
-      lit(&E, ",\"fields\":", 10);
-      num(&E, k);
-      lit(&E, "}", 1);
-      for (; k < (u32)width; k++) lit(&O, ",\"\"", 3);
-    } else if (k > (u32)width) {
-      error_head("long_row", 8);
-      lit(&E, ",\"extra\":[", 10);
-      append(&E, &X);
-      lit(&E, "]}", 2);
+    OROOM(64);
+    *o++ = ']';
+    if (!recs) {
+      // Room for finish() to turn the separator after the first record into `,"rows":[`.
+      first_end = (u32)(o - O.p);
+      for (u32 j = 0; j < 9; j++) o[j] = ' ';
+      o += 9;
     }
-    lit(&O, "]", 1);
-    rows++;
+    recs++;
   }
-  if (header && !columns_set) lit(&O, "[],\"rows\":[", 11);
-  lit(&O, "],\"errors\":[", 12);
-  append(&O, &E);
+  OROOM(64);
+  *o++ = ']';
+  O.len = (u32)(o - O.p);
+  pos = (u32)(p - s);
+  case_recs = recs;
+}
+
+// Ends the case answer() wrote, now that its header flag is known. With a header the first record is the columns:
+// `{"columns":null,"rows":[` becomes `{"columns":` and spaces, the 9 spaces after the first record become `,"rows":[`,
+// and the comma before the second record a space (with no record at all, the columns are []).
+static void finish(int header) {
+  if (header) {
+    u8 *c = O.p + case_start;
+    if (!case_recs) {
+      __builtin_memcpy(c, "{\"columns\":[],\"rows\":[  ", 24);
+    } else {
+      __builtin_memcpy(c, "{\"columns\":             ", 24);
+      __builtin_memcpy(O.p + first_end, ",\"rows\":[", 9);
+      if (case_recs > 1) O.p[first_end + 9] = ' ';
+    }
+  }
+  lit(&O, ",\"errors\":[", 11);
+  for (u32 j = 0; j < nerr; j++) {
+    Err *e = &errs[j];
+    if (j) lit(&O, ",", 1);
+    lit(&O, "{\"code\":\"", 9);
+    lit(&O, e->code, e->code_len);
+    lit(&O, "\",\"line\":", 9);
+    num(&O, e->line);
+    lit(&O, ",\"row\":", 7);
+    if (header && !e->rec) lit(&O, "null", 4);
+    else num(&O, e->rec - (u32)header);
+    if (e->kind == 1) {
+      lit(&O, ",\"fields\":", 10);
+      num(&O, e->a);
+    } else if (e->kind == 2) {
+      lit(&O, ",\"extra\":[", 10);
+      ENSURE(&O, e->b);
+      __builtin_memcpy(O.p + O.len, XS.p + e->a, e->b);
+      O.len += e->b;
+      lit(&O, "]", 1);
+    }
+    lit(&O, "}", 1);
+  }
   lit(&O, "]}", 2);
 }
 
@@ -485,11 +734,14 @@ __attribute__((export_name("run"))) int run(void) {
   for (u32 k = 0; k < 64; k++) t[n + k] = 0;
   t[n] = '"';
 
-  O.cap = n + n / 2 + 4096;
+  // Each case's answer is handed to flush() once it is whole, so O holds one case at a time.
+  O.cap = 1 << 22;
   O.p = bump(O.cap + 32);
   O.len = 0;
-  E.cap = 1 << 20;
-  E.p = bump(E.cap + 32);
+  errcap = 4096;
+  errs = (Err *)bump(errcap * (u32)sizeof(Err));
+  XS.cap = 1 << 16;
+  XS.p = bump(XS.cap + 32);
   X.cap = 1 << 16;
   X.p = bump(X.cap + 32);
 
@@ -501,16 +753,17 @@ __attribute__((export_name("run"))) int run(void) {
     i++;
   } else {
     for (int first = 1;; first = 0) {
-      u32 text = 0;
-      int header = 0;
+      if (!first) lit(&O, ",", 1);
+      int got = 0, header = 0;
       OBJECT(i, {
         if (key_is(ka, kb, "input", 5)) {
           OBJECT(i, {
             if (key_is(ka, kb, "text", 4)) {
               expect(i, '"');
-              if (text) __builtin_trap();
-              text = i + 1;
-              i = skip_string(i);
+              if (got) __builtin_trap();
+              got = 1;
+              answer(i + 1);
+              i = pos + 1;
             } else if (key_is(ka, kb, "header", 6)) {
               header = i + 4 <= n && s[i] == 't' && s[i + 1] == 'r' && s[i + 2] == 'u' && s[i + 3] == 'e';
               i = skip_value(i);
@@ -522,9 +775,10 @@ __attribute__((export_name("run"))) int run(void) {
           i = skip_value(i);
         }
       });
-      if (!text) __builtin_trap();
-      if (!first) lit(&O, ",", 1);
-      answer(text, header);
+      if (!got) __builtin_trap();
+      finish(header);
+      flush(O.p, O.len);
+      O.len = 0;
       i = ws(i);
       if (s[i] == ',') {
         i = ws(i + 1);
